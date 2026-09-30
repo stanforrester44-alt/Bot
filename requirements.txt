@@ -1,0 +1,7 @@
+# Волчишка Bot — Зависимости Python
+# pip install -r requirements.txt
+
+python-telegram-bot[httpx]==21.3
+httpx>=0.25.0
+edge-tts>=6.1.10
+python-dotenv>=1.0.0
