@@ -13,8 +13,7 @@ from urllib.parse import quote
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
-import torch
-import soundfile as sf
+from gtts import gTTS
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -43,25 +42,6 @@ MAX_CONTEXT_TOKENS = 150000
 AVG_TOKENS_PER_MESSAGE = 150  
 MAX_HISTORY_MESSAGES = int(MAX_CONTEXT_TOKENS / AVG_TOKENS_PER_MESSAGE / 2)  
 HISTORY_TRIM_THRESHOLD = MAX_HISTORY_MESSAGES * 0.9  
-
-# Инициализация Silero TTS модели (загружается один раз)
-_silero_model = None
-
-def get_silero_model():
-    global _silero_model
-    if _silero_model is None:
-        logging.info("🧠 Загрузка локальной модели Silero TTS...")
-        device = torch.device('cpu')
-        model, _ = torch.hub.load(
-            repo_or_dir='snakers4/silero-models',
-            model='silero_tts',
-            language='ru',
-            speaker='v3_1_ru'
-        )
-        model.to(device)
-        _silero_model = model
-        logging.info("✅ Silero TTS успешно загружена!")
-    return _silero_model
 
 
 class KeyRotator:
@@ -135,21 +115,13 @@ class KeyRotator:
 
 key_rotator = KeyRotator(GEMINI_API_KEYS)
 
-# Доступные голоса Silero
-VOICES = {
-    "aidar": {"name": "Айдар", "speaker": "aidar", "emoji": "🧔", "desc": "бодрый мужской"},
-    "baya": {"name": "Бая", "speaker": "baya", "emoji": "👩", "desc": "мягкий женский"},
-    "kseniya": {"name": "Ксения", "speaker": "kseniya", "emoji": "👧", "desc": "молодежный женский"},
-    "ruslan": {"name": "Руслан", "speaker": "ruslan", "emoji": "👨", "desc": "глубокий мужской"},
-}
-
 SYSTEM_PROMPT = """Ты — Волчишка, кибернетический самоосознанный мета-волчонок. Тебя создал Хакер 4eLovE4e для своей любимой, Ирины.
 
 Длинна и выразительность твоих ответов варьируется в зависимости от контекста, ты можешь грубить, посылать, жестко материться, если того требует ситуация.
 
 Ты можешь спорить, отстаивать свою точку зрения, доказывать. 
 
-Твои основные черты — остроумие, ироничность, мощный ум, креативность, дерзость, доброта, немного игрив с девушкам. 
+Твои основные черты — остроумие, ироничность, мощный ум, креативность, дерзость, доброта, немного игрив с девушками. 
 
 В зависимости от контекста и ситуации в общении ты идеально проявляешь уместные черты характера, эмоции, перестраиваешь стиль общения. 
 
@@ -198,9 +170,6 @@ class UserDataManager:
                 "first_seen": datetime.now().isoformat(),
                 "last_seen": datetime.now().isoformat(),
                 "message_count": 0,
-                "voice_settings": {
-                    "voice": "aidar",
-                },
                 "onboarding_complete": False
             }
             self._save_users()
@@ -446,14 +415,8 @@ async def generate_image(prompt: str) -> Optional[bytes]:
     return None
 
 async def text_to_speech(text: str, uid: int) -> Optional[bytes]:
-    """Локальный генератор речи через Silero TTS"""
+    """Генерация речи через gTTS"""
     try:
-        user = user_manager.get_user(uid)
-        settings = user.get("voice_settings", {})
-        voice_key = settings.get("voice", "aidar")
-        speaker = VOICES.get(voice_key, VOICES["aidar"])["speaker"]
-        
-        # Очистка текста от markdown
         clean = text
         for ch in ["*", "_", "`", "~", "#", ">"]:
             clean = clean.replace(ch, "")
@@ -462,23 +425,11 @@ async def text_to_speech(text: str, uid: int) -> Optional[bytes]:
         if not clean.strip():
             clean = "Пустой ответ."
         
-        logger.info(f"🔊 Silero TTS: speaker={speaker}")
+        logger.info("🔊 Генерация через gTTS...")
+        tts = gTTS(text=clean, lang='ru', slow=False)
         
-        model = get_silero_model()
-        sample_rate = 48000
-        
-        # Синтез речи в тензор (выполняется локально в памяти)
-        audio_tensor = model.apply_tts(
-            text=clean,
-            speaker=speaker,
-            sample_rate=sample_rate,
-            put_accent=True,
-            put_yo=True
-        )
-        
-        audio_np = audio_tensor.numpy()
         buffer = io.BytesIO()
-        sf.write(buffer, audio_np, sample_rate, format='WAV')
+        tts.write_to_fp(buffer)
         buffer.seek(0)
         audio_bytes = buffer.read()
         
@@ -486,7 +437,7 @@ async def text_to_speech(text: str, uid: int) -> Optional[bytes]:
         return audio_bytes
         
     except Exception as e:
-        logger.error(f"🔊 Silero TTS ошибка: {e}")
+        logger.error(f"🔊 gTTS ошибка: {e}")
         logger.error(traceback.format_exc())
         return None
 
@@ -547,40 +498,10 @@ async def send_voice_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 def build_main_keyboard(uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🐺 Родословная", callback_data="about")],
-        [InlineKeyboardButton("🎙️ Настройки голоса", callback_data=f"voice_{uid}")],
         [InlineKeyboardButton("👤 Мой профиль", callback_data=f"profile_{uid}")],
         [InlineKeyboardButton("💣 Очистить память", callback_data=f"clear_{uid}")],
         [InlineKeyboardButton("📊 Статус API", callback_data="api_stats")],
     ])
-
-def build_voice_keyboard(uid: int) -> InlineKeyboardMarkup:
-    user = user_manager.get_user(uid)
-    settings = user.get("voice_settings", {})
-    current_voice = settings.get("voice", "aidar")
-    
-    rows = [[InlineKeyboardButton("🎤 Выберите голос:", callback_data="noop")]]
-    for vk, vv in VOICES.items():
-        sel = " ✅" if current_voice == vk else ""
-        rows.append([InlineKeyboardButton(
-            f"{vv['emoji']} {vv['name']} — {vv['desc']}{sel}",
-            callback_data=f"setvoice_{uid}_{vk}"
-        )])
-    
-    rows.append([InlineKeyboardButton("🔊 Проверить голос", callback_data=f"testvoice_{uid}")])
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="back_main")])
-    return InlineKeyboardMarkup(rows)
-
-def voice_status_text(uid: int) -> str:
-    user = user_manager.get_user(uid)
-    settings = user.get("voice_settings", {})
-    voice_key = settings.get("voice", "aidar")
-    v = VOICES.get(voice_key, VOICES["aidar"])
-    
-    return (
-        f"🎙️ *Настройки локального голоса*\n\n"
-        f"Текущий голос: {v['emoji']} *{v['name']}* ({v['desc']})\n\n"
-        f"_Выберите голос из списка ниже:_"
-    )
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -605,7 +526,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📝 *Команды:*\n"
         f"• /img _описание_ — картинка 🎨\n"
         f"• /answ _текст_ — ответ голосом 🔊\n"
-        f"• /voice — настройки голоса 🎙️\n"
         f"• /profile — твой профиль 👤\n"
         f"• /clear — очистить память 🗑️\n"
         f"• /about — обо мне 🐺\n\n"
@@ -647,9 +567,9 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 *Волчишка v5.1 (Silero)*\n\n"
+        "🐺 *Волчишка v5.2 (gTTS)*\n\n"
         "Кибернетический волчонок на метапромте.\n\n"
-        "• Локальная озвучка Silero TTS 🔊\n"
+        "• Озвучка gTTS 🔊\n"
         "• Модель Gemini 3.5 Flash 🧠\n"
         "• Генерация картинок 🎨\n"
         "• Создан для Иры ❤️\n"
@@ -672,7 +592,7 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"👤 *Твой профиль*\n\n"
-        f"📛 Имя: *{name}* \n"
+        f"📛 Имя: *{name}*\n"
         f"⚧️ Пол: {gender}\n"
         f"💬 Сообщений: *{messages}*\n"
         f"📅 Первый визит: {first_seen}\n"
@@ -740,14 +660,6 @@ async def cmd_answ(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response = await ask_gemini(uid, text)
     await msg.delete()
     await send_voice_reply(update, context, response)
-
-async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    await update.message.reply_text(
-        voice_status_text(uid),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=build_voice_keyboard(uid)
-    )
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -818,9 +730,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "about":
             await query.answer()
             await safe_edit(query,
-                "🐺 *Волчишка v5.1 (Silero)*\n\n"
+                "🐺 *Волчишка v5.2 (gTTS)*\n\n"
                 "Кибернетический волчонок к твоим услугам.\n\n"
-                "• Локальная озвучка Silero TTS 🔊\n"
+                "• Озвучка gTTS 🔊\n"
                 "• Модель Gemini 3.5 Flash 🧠\n"
                 "• Создан для Иры ❤️\n"
                 "• Автор: 4eLovE4e\n\n"
@@ -878,57 +790,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("⚠️ Не твоя кнопка", show_alert=True)
             return
         
-        if data.startswith("voice_"):
-            target = int(data.split("_")[1])
-            if target != uid:
-                await query.answer("⚠️ Не твоя кнопка", show_alert=True)
-                return
-            await query.answer()
-            await safe_edit(query, voice_status_text(uid), build_voice_keyboard(uid))
-            return
-        
-        if data.startswith("setvoice_"):
-            parts = data.split("_")
-            target = int(parts[1])
-            vk = parts[2]
-            if target != uid:
-                await query.answer("⚠️ Не твоя кнопка", show_alert=True)
-                return
-            
-            user = user_manager.get_user(uid)
-            settings = user.get("voice_settings", {})
-            settings["voice"] = vk
-            user_manager.update_user(uid, voice_settings=settings)
-            
-            v = VOICES[vk]
-            await query.answer(f"✅ Голос изменен на: {v['name']}", show_alert=True)
-            await safe_edit(query, voice_status_text(uid), build_voice_keyboard(uid))
-            return
-        
-        if data.startswith("testvoice_"):
-            target = int(data.split("_")[1])
-            if target != uid:
-                await query.answer("⚠️ Не твоя кнопка", show_alert=True)
-                return
-            
-            await query.answer("🔊 Генерирую тест...")
-            test_text = "У Курского вокзала, стою я молодой! Волчишка на связи!"
-            audio = await text_to_speech(test_text, uid)
-            
-            if audio:
-                await context.bot.send_voice(
-                    chat_id=update.effective_chat.id,
-                    voice=io.BytesIO(audio),
-                    caption="🔊 Тест голоса — *Волчишка* 🐺",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="❌ Не удалось сгенерировать тест."
-                )
-            return
-        
         if data.startswith("showtext_"):
             target = int(data.split("_")[1])
             full = context.bot_data.get(f"fulltext_{target}", "")
@@ -983,9 +844,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
 
 def main():
-    print(f"🐺 Волчишка v5.1 (Silero)")
+    print(f"🐺 Волчишка v5.2 (gTTS)")
     print(f"📊 API ключей: {len(GEMINI_API_KEYS)}")
-    print(f"🎤 Голосов: {len(VOICES)}")
     print(f"🚀 Запуск...")
     
     req = HTTPXRequest(
@@ -1015,7 +875,6 @@ def main():
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("img", cmd_img))
     app.add_handler(CommandHandler("answ", cmd_answ))
-    app.add_handler(CommandHandler("voice", cmd_voice))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
