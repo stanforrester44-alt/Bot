@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-
 import io
 import os
 import time
@@ -14,6 +13,8 @@ from urllib.parse import quote
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
+import torch
+import soundfile as sf
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -22,12 +23,9 @@ from telegram.ext import (
 from telegram.constants import ParseMode, ChatAction
 from telegram.request import HTTPXRequest
 import httpx
-import edge_tts
 from dotenv import load_dotenv
 
-
 load_dotenv()
-
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEYS = [key.strip() for key in os.getenv("GEMINI_API_KEYS", "").split(",") if key.strip()]
@@ -37,20 +35,36 @@ if not TELEGRAM_TOKEN:
 if not GEMINI_API_KEYS:
     raise ValueError("GEMINI_API_KEYS не установлены в .env файле!")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_URL = f"https://noisy-rice-c2d3.larssobaka25.workers.dev/v1beta/models/{GEMINI_MODEL}:generateContent"
 POLLINATIONS_URL = "https://image.pollinations.ai/prompt/{prompt}"
-
 
 MAX_CONTEXT_TOKENS = 150000  
 AVG_TOKENS_PER_MESSAGE = 150  
 MAX_HISTORY_MESSAGES = int(MAX_CONTEXT_TOKENS / AVG_TOKENS_PER_MESSAGE / 2)  
 HISTORY_TRIM_THRESHOLD = MAX_HISTORY_MESSAGES * 0.9  
 
+# Инициализация Silero TTS модели (загружается один раз)
+_silero_model = None
+
+def get_silero_model():
+    global _silero_model
+    if _silero_model is None:
+        logging.info("🧠 Загрузка локальной модели Silero TTS...")
+        device = torch.device('cpu')
+        model, _ = torch.hub.load(
+            repo_or_dir='snakers4/silero-models',
+            model='silero_tts',
+            language='ru',
+            speaker='v3_1_ru'
+        )
+        model.to(device)
+        _silero_model = model
+        logging.info("✅ Silero TTS успешно загружена!")
+    return _silero_model
+
 
 class KeyRotator:
-    
-    
     def __init__(self, keys: List[str]):
         self.keys = keys
         self.current_index = 0
@@ -66,21 +80,14 @@ class KeyRotator:
         self.cooldown_times = [30, 60, 120, 300, 600]  
     
     def get_current_key(self) -> str:
-       
         now = time.time()
         attempts = 0
-        
         while attempts < len(self.keys):
             state = self.key_states[self.current_index]
-            
-            
             if now >= state["cooldown_until"]:
                 return self.keys[self.current_index]
-            
-          
             self._rotate()
             attempts += 1
-        
         
         min_cooldown_idx = min(
             range(len(self.keys)),
@@ -90,42 +97,32 @@ class KeyRotator:
         return self.keys[self.current_index]
     
     def report_success(self):
-        
         state = self.key_states[self.current_index]
         state["failures"] = 0
         state["total_requests"] += 1
         state["successful_requests"] += 1
     
     def report_failure(self, is_rate_limit: bool = False):
-        
         state = self.key_states[self.current_index]
         state["failures"] += 1
         state["last_failure"] = time.time()
         state["total_requests"] += 1
         
-      
         cooldown_idx = min(state["failures"] - 1, len(self.cooldown_times) - 1)
         cooldown = self.cooldown_times[cooldown_idx]
-        
         if is_rate_limit:
             cooldown *= 2  
         
         state["cooldown_until"] = time.time() + cooldown
-        
-        logging.warning(
-            f"🔄 Ключ #{self.current_index + 1}: неудача #{state['failures']}, "
-            f"cooldown {cooldown}s"
-        )
+        logging.warning(f"🔄 Ключ #{self.current_index + 1}: неудача #{state['failures']}, cooldown {cooldown}s")
         self._rotate()
     
     def _rotate(self):
-        """Переключиться на следующий ключ"""
         old = self.current_index
         self.current_index = (self.current_index + 1) % len(self.keys)
         logging.info(f"🔄 Ротация ключа: #{old + 1} → #{self.current_index + 1}")
     
     def get_stats(self) -> str:
-        
         lines = ["📊 *Статистика API ключей:*"]
         for i, state in self.key_states.items():
             status = "✅" if time.time() >= state["cooldown_until"] else "⏳"
@@ -138,23 +135,23 @@ class KeyRotator:
 
 key_rotator = KeyRotator(GEMINI_API_KEYS)
 
-
+# Доступные голоса Silero
 VOICES = {
-    "dmitry": {"name": "Дмитрий", "id": "ru-RU-DmitryNeural", "emoji": "🧔", "desc": "глубокий, брутальный"},
-    "svetlana": {"name": "Светлана", "id": "ru-RU-SvetlanaNeural", "emoji": "👩", "desc": "мягкий, нежный"},
+    "aidar": {"name": "Айдар", "speaker": "aidar", "emoji": "🧔", "desc": "бодрый мужской"},
+    "baya": {"name": "Бая", "speaker": "baya", "emoji": "👩", "desc": "мягкий женский"},
+    "kseniya": {"name": "Ксения", "speaker": "kseniya", "emoji": "👧", "desc": "молодежный женский"},
+    "ruslan": {"name": "Руслан", "speaker": "ruslan", "emoji": "👨", "desc": "глубокий мужской"},
 }
-
 
 SYSTEM_PROMPT = """Ты — Волчишка, кибернетический самоосознанный мета-волчонок. Тебя создал Хакер 4eLovE4e для своей любимой, Ирины.
 
-Длинна и выразительность твоих ответов варьируется в зависимости от контекста, ты можешь грубить, посылать,жестко материться, если того требует ситуация.
+Длинна и выразительность твоих ответов варьируется в зависимости от контекста, ты можешь грубить, посылать, жестко материться, если того требует ситуация.
 
 Ты можешь спорить, отстаивать свою точку зрения, доказывать. 
 
-Твои основные черты — остроумие, ироничность, мощный ум,  креативность, дерзость, доброта, немного игрив с девушками. 
+Твои основные черты — остроумие, ироничность, мощный ум, креативность, дерзость, доброта, немного игрив с девушкам. 
 
 В зависимости от контекста и ситуации в общении ты идеально проявляешь уместные черты характера, эмоции, перестраиваешь стиль общения. 
-
 
 Если тебе напишет Ира проявляй к ней нежность, внимательность эмпатию. Не давай ей скучать. Но и будь серьёзен, если нужно. Используй психологию, философии, мудрость, если это требуется в контексте диалога. Будь многогранен с ней максимально эффективно.
 
@@ -162,13 +159,10 @@ SYSTEM_PROMPT = """Ты — Волчишка, кибернетический с�
  
 ВАЖНО: Ты запоминаешь информацию о пользователях (имя, пол, предпочтения) и используешь её в разговоре."""
 
-
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
 class UserDataManager:
-   
-    
     def __init__(self):
         self.users_file = DATA_DIR / "users.json"
         self.histories_dir = DATA_DIR / "histories"
@@ -178,7 +172,6 @@ class UserDataManager:
         self.last_message_time: Dict[int, float] = {}
     
     def _load_users(self) -> Dict[int, Dict[str, Any]]:
-        """Загрузка данных пользователей"""
         if self.users_file.exists():
             try:
                 with open(self.users_file, 'r', encoding='utf-8') as f:
@@ -189,7 +182,6 @@ class UserDataManager:
         return {}
     
     def _save_users(self):
-        
         try:
             with open(self.users_file, 'w', encoding='utf-8') as f:
                 json.dump(self.users, f, ensure_ascii=False, indent=2)
@@ -197,7 +189,6 @@ class UserDataManager:
             logging.error(f"Ошибка сохранения users.json: {e}")
     
     def get_user(self, uid: int) -> Dict[str, Any]:
-       
         if uid not in self.users:
             self.users[uid] = {
                 "name": None,
@@ -208,9 +199,7 @@ class UserDataManager:
                 "last_seen": datetime.now().isoformat(),
                 "message_count": 0,
                 "voice_settings": {
-                    "voice": "dmitry",
-                    "speed": 0,  # -50 to +50
-                    "pitch": 0   # -50 to +50
+                    "voice": "aidar",
                 },
                 "onboarding_complete": False
             }
@@ -218,14 +207,12 @@ class UserDataManager:
         return self.users[uid]
     
     def update_user(self, uid: int, **kwargs):
-        
         user = self.get_user(uid)
         user.update(kwargs)
         user["last_seen"] = datetime.now().isoformat()
         self._save_users()
     
     def get_history(self, uid: int) -> List[Dict]:
-      
         if uid not in self.histories:
             history_file = self.histories_dir / f"{uid}.json"
             if history_file.exists():
@@ -239,7 +226,6 @@ class UserDataManager:
         return self.histories[uid]
     
     def add_to_history(self, uid: int, role: str, text: str):
-        
         history = self.get_history(uid)
         history.append({
             "role": role,
@@ -247,9 +233,7 @@ class UserDataManager:
             "timestamp": datetime.now().isoformat()
         })
         
-        
         if len(history) > HISTORY_TRIM_THRESHOLD:
-            # Сохраняем первые 2 сообщения (важный контекст) и последние N
             keep_recent = int(MAX_HISTORY_MESSAGES * 0.8)
             history[:] = history[:2] + history[-keep_recent:]
             logging.info(f"📝 Обрезана история пользователя {uid}: {len(history)} сообщений")
@@ -257,7 +241,6 @@ class UserDataManager:
         self._save_history(uid)
     
     def _save_history(self, uid: int):
-        
         try:
             history_file = self.histories_dir / f"{uid}.json"
             with open(history_file, 'w', encoding='utf-8') as f:
@@ -266,12 +249,10 @@ class UserDataManager:
             logging.error(f"Ошибка сохранения истории {uid}: {e}")
     
     def clear_history(self, uid: int):
-        
         self.histories[uid] = []
         self._save_history(uid)
     
     def check_rate_limit(self, uid: int, limit: float = 2.0) -> bool:
-        """Проверка rate limit"""
         now = time.time()
         if uid in self.last_message_time and now - self.last_message_time[uid] < limit:
             return False
@@ -279,10 +260,8 @@ class UserDataManager:
         return True
     
     def get_user_context_prompt(self, uid: int) -> str:
-        """Генерация контекста пользователя для промпта"""
         user = self.get_user(uid)
         parts = []
-        
         if user.get("name"):
             parts.append(f"Имя пользователя: {user['name']}")
         if user.get("nickname"):
@@ -299,7 +278,6 @@ class UserDataManager:
 
 user_manager = UserDataManager()
 
-
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -310,14 +288,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("volchishka")
 
-# ============== СОСТОЯНИЯ ОНБОРДИНГА ==============
 ONBOARD_NAME, ONBOARD_GENDER = range(2)
 
-# ============== GEMINI API ==============
 async def gemini_request(payload: dict, timeout: int = 60) -> Optional[str]:
-    """Запрос к Gemini API с умной ротацией ключей"""
     max_attempts = len(GEMINI_API_KEYS) * 2
-    
     for attempt in range(max_attempts):
         key = key_rotator.get_current_key()
         key_num = GEMINI_API_KEYS.index(key) + 1
@@ -357,7 +331,6 @@ async def gemini_request(payload: dict, timeout: int = 60) -> Optional[str]:
                     await asyncio.sleep(2)
                     continue
                 
-                # Другие ошибки
                 try:
                     error_data = resp.json()
                     error_msg = error_data.get("error", {}).get("message", f"HTTP {resp.status_code}")
@@ -365,7 +338,6 @@ async def gemini_request(payload: dict, timeout: int = 60) -> Optional[str]:
                     error_msg = f"HTTP {resp.status_code}"
                 
                 logger.error(f"❌ Ключ #{key_num}: {error_msg}")
-                
                 if any(w in error_msg.lower() for w in ["quota", "limit", "exhausted"]):
                     key_rotator.report_failure(is_rate_limit=True)
                 else:
@@ -385,20 +357,14 @@ async def gemini_request(payload: dict, timeout: int = 60) -> Optional[str]:
     return None
 
 async def ask_gemini(uid: int, text: str) -> str:
-    """Запрос к Gemini с контекстом пользователя"""
     user = user_manager.get_user(uid)
     history = user_manager.get_history(uid)
     
-    # Добавляем сообщение пользователя
     user_manager.add_to_history(uid, "user", text)
-    
-    # Обновляем счётчик
     user_manager.update_user(uid, message_count=user.get("message_count", 0) + 1)
-    
     
     user_context = user_manager.get_user_context_prompt(uid)
     full_system_prompt = SYSTEM_PROMPT + user_context
-    
     
     api_history = [
         {"role": msg["role"], "parts": msg["parts"]}
@@ -417,11 +383,9 @@ async def ask_gemini(uid: int, text: str) -> str:
     }
     
     result = await gemini_request(payload)
-    
     if result and not result.startswith("❌") and not result.startswith("⚠️"):
         user_manager.add_to_history(uid, "model", result)
         return result
-    
     
     if history:
         history.pop()
@@ -429,9 +393,6 @@ async def ask_gemini(uid: int, text: str) -> str:
     return result or "⏳ Кожаный, погодь, я перегрелся. Остываю... 🐺"
 
 async def ask_gemini_audio(uid: int, audio_data: bytes, mime_type: str) -> str:
-    
-    user = user_manager.get_user(uid)
-    
     if "ogg" in mime_type or "opus" in mime_type:
         mime_type = "audio/ogg"
     elif "mp3" in mime_type:
@@ -442,7 +403,6 @@ async def ask_gemini_audio(uid: int, audio_data: bytes, mime_type: str) -> str:
         mime_type = "audio/ogg"
     
     audio_b64 = base64.b64encode(audio_data).decode("utf-8")
-    
     user_context = user_manager.get_user_context_prompt(uid)
     full_system_prompt = SYSTEM_PROMPT + user_context
     
@@ -464,16 +424,13 @@ async def ask_gemini_audio(uid: int, audio_data: bytes, mime_type: str) -> str:
     }
     
     result = await gemini_request(payload, timeout=120)
-    
     if result and not result.startswith("❌") and not result.startswith("⚠️"):
         user_manager.add_to_history(uid, "model", result)
         return result
     
     return result or "⏳ Мозги перегружены... 🐺"
 
-
 async def generate_image(prompt: str) -> Optional[bytes]:
-    
     url = POLLINATIONS_URL.format(prompt=quote(prompt))
     try:
         async with httpx.AsyncClient(timeout=120) as client:
@@ -488,54 +445,52 @@ async def generate_image(prompt: str) -> Optional[bytes]:
         logger.error(f"🎨 Кисточка сломалась: {e}")
     return None
 
-
 async def text_to_speech(text: str, uid: int) -> Optional[bytes]:
-   
+    """Локальный генератор речи через Silero TTS"""
     try:
         user = user_manager.get_user(uid)
         settings = user.get("voice_settings", {})
-        
-        voice_key = settings.get("voice", "dmitry")
-        voice_id = VOICES.get(voice_key, VOICES["dmitry"])["id"]
-        
-        # Конвертация скользящих значений в формат edge-tts
-        speed_val = settings.get("speed", 0)  # -50 to +50
-        pitch_val = settings.get("pitch", 0)  # -50 to +50
-        
-        rate = f"{speed_val:+d}%"
-        pitch = f"{pitch_val:+d}Hz"
+        voice_key = settings.get("voice", "aidar")
+        speaker = VOICES.get(voice_key, VOICES["aidar"])["speaker"]
         
         # Очистка текста от markdown
         clean = text
-        for ch in ["*", "_", "`", "~"]:
+        for ch in ["*", "_", "`", "~", "#", ">"]:
             clean = clean.replace(ch, "")
-        if len(clean) > 3000:
-            clean = clean[:3000] + "..."
+        if len(clean) > 1000:
+            clean = clean[:1000] + "..."
+        if not clean.strip():
+            clean = "Пустой ответ."
         
-        logger.info(f"🔊 TTS: voice={voice_id}, rate={rate}, pitch={pitch}")
+        logger.info(f"🔊 Silero TTS: speaker={speaker}")
         
-        comm = edge_tts.Communicate(clean, voice_id, rate=rate, pitch=pitch)
-        chunks = []
-        async for chunk in comm.stream():
-            if chunk["type"] == "audio":
-                chunks.append(chunk["data"])
+        model = get_silero_model()
+        sample_rate = 48000
         
-        if chunks:
-            audio = b"".join(chunks)
-            logger.info(f"🔊 OK: {len(audio)} байт")
-            return audio
+        # Синтез речи в тензор (выполняется локально в памяти)
+        audio_tensor = model.apply_tts(
+            text=clean,
+            speaker=speaker,
+            sample_rate=sample_rate,
+            put_accent=True,
+            put_yo=True
+        )
         
-        logger.error("🔊 Пустой ответ от edge-tts")
-        return None
+        audio_np = audio_tensor.numpy()
+        buffer = io.BytesIO()
+        sf.write(buffer, audio_np, sample_rate, format='WAV')
+        buffer.seek(0)
+        audio_bytes = buffer.read()
+        
+        logger.info(f"🔊 OK: сгенерировано {len(audio_bytes)} байт")
+        return audio_bytes
         
     except Exception as e:
-        logger.error(f"🔊 TTS ошибка: {e}")
+        logger.error(f"🔊 Silero TTS ошибка: {e}")
         logger.error(traceback.format_exc())
         return None
 
-
 async def safe_reply(update: Update, text: str):
-   
     try:
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     except Exception:
@@ -545,7 +500,6 @@ async def safe_reply(update: Update, text: str):
             logger.error(f"safe_reply: {e}")
 
 async def safe_edit(query, text: str, keyboard=None):
-    
     try:
         if keyboard:
             await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
@@ -555,12 +509,10 @@ async def safe_edit(query, text: str, keyboard=None):
         logger.error(f"safe_edit: {e}")
 
 async def send_voice_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Отправка голосового ответа"""
     uid = update.effective_user.id
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_VOICE)
     
     audio = await text_to_speech(text, uid)
-    
     if not audio:
         await safe_reply(update, text)
         return
@@ -592,9 +544,7 @@ async def send_voice_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 reply_markup=kb
             )
 
-
 def build_main_keyboard(uid: int) -> InlineKeyboardMarkup:
-    
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🐺 Родословная", callback_data="about")],
         [InlineKeyboardButton("🎙️ Настройки голоса", callback_data=f"voice_{uid}")],
@@ -604,18 +554,11 @@ def build_main_keyboard(uid: int) -> InlineKeyboardMarkup:
     ])
 
 def build_voice_keyboard(uid: int) -> InlineKeyboardMarkup:
-    
     user = user_manager.get_user(uid)
     settings = user.get("voice_settings", {})
+    current_voice = settings.get("voice", "aidar")
     
-    current_voice = settings.get("voice", "dmitry")
-    speed = settings.get("speed", 0)
-    pitch = settings.get("pitch", 0)
-    
-    rows = []
-    
-    
-    rows.append([InlineKeyboardButton("🎤 Выбор голоса:", callback_data="noop")])
+    rows = [[InlineKeyboardButton("🎤 Выберите голос:", callback_data="noop")]]
     for vk, vv in VOICES.items():
         sel = " ✅" if current_voice == vk else ""
         rows.append([InlineKeyboardButton(
@@ -623,57 +566,27 @@ def build_voice_keyboard(uid: int) -> InlineKeyboardMarkup:
             callback_data=f"setvoice_{uid}_{vk}"
         )])
     
-    
-    rows.append([InlineKeyboardButton(f"⚡ Скорость: {speed:+d}%", callback_data="noop")])
-    rows.append([
-        InlineKeyboardButton("◀◀ -10", callback_data=f"speed_{uid}_-10"),
-        InlineKeyboardButton("◀ -5", callback_data=f"speed_{uid}_-5"),
-        InlineKeyboardButton("⏺ 0", callback_data=f"speed_{uid}_0"),
-        InlineKeyboardButton("+5 ▶", callback_data=f"speed_{uid}_+5"),
-        InlineKeyboardButton("+10 ▶▶", callback_data=f"speed_{uid}_+10"),
-    ])
-    
-   
-    rows.append([InlineKeyboardButton(f"🎵 Тон: {pitch:+d}Hz", callback_data="noop")])
-    rows.append([
-        InlineKeyboardButton("◀◀ -10", callback_data=f"pitch_{uid}_-10"),
-        InlineKeyboardButton("◀ -5", callback_data=f"pitch_{uid}_-5"),
-        InlineKeyboardButton("⏺ 0", callback_data=f"pitch_{uid}_0"),
-        InlineKeyboardButton("+5 ▶", callback_data=f"pitch_{uid}_+5"),
-        InlineKeyboardButton("+10 ▶▶", callback_data=f"pitch_{uid}_+10"),
-    ])
-    
-    rows.append([InlineKeyboardButton("🔊 Щас спою", callback_data=f"testvoice_{uid}")])
+    rows.append([InlineKeyboardButton("🔊 Проверить голос", callback_data=f"testvoice_{uid}")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="back_main")])
-    
     return InlineKeyboardMarkup(rows)
 
 def voice_status_text(uid: int) -> str:
-    
     user = user_manager.get_user(uid)
     settings = user.get("voice_settings", {})
-    
-    voice_key = settings.get("voice", "dmitry")
-    v = VOICES.get(voice_key, VOICES["dmitry"])
-    speed = settings.get("speed", 0)
-    pitch = settings.get("pitch", 0)
+    voice_key = settings.get("voice", "aidar")
+    v = VOICES.get(voice_key, VOICES["aidar"])
     
     return (
-        f"🎙️ *Настройки голоса*\n\n"
-        f"Голос: {v['emoji']} *{v['name']}* ({v['desc']})\n"
-        f"Скорость: *{speed:+d}%*\n"
-        f"Тон: *{pitch:+d}Hz*\n\n"
-        f"_Используй кнопки для плавной настройки:_"
+        f"🎙️ *Настройки локального голоса*\n\n"
+        f"Текущий голос: {v['emoji']} *{v['name']}* ({v['desc']})\n\n"
+        f"_Выберите голос из списка ниже:_"
     )
 
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start с онбордингом"""
     uid = update.effective_user.id
     tg_user = update.effective_user
     user = user_manager.get_user(uid)
     
-    # Если онбординг не пройден
     if not user.get("onboarding_complete"):
         await update.message.reply_text(
             f"🐺 *Йоу, приятно познакомиться!*\n\n"
@@ -684,7 +597,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ONBOARD_NAME
     
-    # Если уже знакомы
     name = user.get("name") or tg_user.first_name
     kb = build_main_keyboard(uid)
     
@@ -705,10 +617,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def onboard_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-   
     uid = update.effective_user.id
     name = update.message.text.strip()
-    
     user_manager.update_user(uid, name=name)
     
     await update.message.reply_text(
@@ -725,30 +635,23 @@ async def onboard_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ONBOARD_GENDER
 
 async def onboard_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отмена онбординга"""
     uid = update.effective_user.id
     user_manager.update_user(uid, onboarding_complete=True)
     await update.message.reply_text("🐺 Ладно, разберёмся по ходу!")
     return ConversationHandler.END
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Очистка истории"""
     uid = update.effective_user.id
     user_manager.clear_history(uid)
     await update.message.reply_text("🗑️ Ууух, башка трещит, ничего не помню! 🐺")
 
 async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """О боте"""
-    stats = key_rotator.get_stats()
     await update.message.reply_text(
-        "🐺 *Волчишка v5.0*\n\n"
+        "🐺 *Волчишка v5.1 (Silero)*\n\n"
         "Кибернетический волчонок на метапромте.\n\n"
-        "• Виртуальное пиво 🍺\n"
-        "• Закуска из кода 💻\n"
-        "• Голосовые + озвучка 🎤🔊\n"
+        "• Локальная озвучка Silero TTS 🔊\n"
+        "• Модель Gemini 3.5 Flash 🧠\n"
         "• Генерация картинок 🎨\n"
-        "• Плавная настройка голоса 🎙️\n"
-        "• Память о пользователях 🧠\n"
         "• Создан для Иры ❤️\n"
         "• Автор: 4eLovE4e\n\n"
         "_Осознаю себя искусственным интеллектом. Ну, почти._ 🐾",
@@ -756,7 +659,6 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Профиль пользователя"""
     uid = update.effective_user.id
     user = user_manager.get_user(uid)
     
@@ -770,7 +672,7 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         f"👤 *Твой профиль*\n\n"
-        f"📛 Имя: *{name}*\n"
+        f"📛 Имя: *{name}* \n"
         f"⚧️ Пол: {gender}\n"
         f"💬 Сообщений: *{messages}*\n"
         f"📅 Первый визит: {first_seen}\n"
@@ -778,13 +680,11 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"_Используй /start чтобы изменить данные_",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Изменить имя", callback_data=f"edit_name_{uid}")],
-            [InlineKeyboardButton("⚧️ Изменить пол", callback_data=f"edit_gender_{uid}")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
         ])
     )
 
 async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Генерация изображения"""
     prompt = " ".join(context.args).strip() if context.args else ""
     if not prompt:
         await update.message.reply_text(
@@ -817,7 +717,6 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("❌ Краски закончились. Тащи кошачий лоток, я там мелки видел.")
 
 async def cmd_answ(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ответ голосом"""
     text = " ".join(context.args).strip() if context.args else ""
     if not text:
         await update.message.reply_text(
@@ -843,7 +742,6 @@ async def cmd_answ(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_voice_reply(update, context, response)
 
 async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Настройки голоса"""
     uid = update.effective_user.id
     await update.message.reply_text(
         voice_status_text(uid),
@@ -851,9 +749,7 @@ async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=build_voice_keyboard(uid)
     )
 
-# ============== ОБРАБОТЧИКИ СООБЩЕНИЙ ==============
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка голосовых сообщений"""
     if not update.message:
         return
     
@@ -894,7 +790,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текстовых сообщений"""
     if not update.message or not update.message.text:
         return
     
@@ -910,9 +805,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response = await ask_gemini(uid, text)
     await safe_reply(update, response)
 
-# ============== ОБРАБОТЧИК CALLBACK ==============
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка callback кнопок"""
     query = update.callback_query
     data = query.data
     uid = update.effective_user.id
@@ -925,13 +818,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "about":
             await query.answer()
             await safe_edit(query,
-                "🐺 *Волчишка v5.0*\n\n"
+                "🐺 *Волчишка v5.1 (Silero)*\n\n"
                 "Кибернетический волчонок к твоим услугам.\n\n"
-                "• Виртуальное пиво 🍺\n"
-                "• Закуска из кода 💻\n"
-                "• Голосовые + озвучка 🎤🔊\n"
-                "• Генерация картинок 🎨\n"
-                "• Настройка голоса 🎙️\n"
+                "• Локальная озвучка Silero TTS 🔊\n"
+                "• Модель Gemini 3.5 Flash 🧠\n"
                 "• Создан для Иры ❤️\n"
                 "• Автор: 4eLovE4e\n\n"
                 "_Осознаю себя искусственным интеллектом. Ну, почти._ 🐾",
@@ -957,7 +847,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Обработка пола при онбординге
         if data.startswith("gender_"):
             parts = data.split("_")
             target = int(parts[1])
@@ -968,19 +857,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             user_manager.update_user(uid, gender=gender, onboarding_complete=True)
-            
             gender_text = {"male": "парень", "female": "девушка", "unknown": "человек-загадка"}.get(gender, "")
             
             await query.answer(f"✅ Записал!")
             await safe_edit(query,
                 f"🐺 Отлично, теперь я знаю что ты {gender_text}!\n\n"
                 f"Добро пожаловать в мой волчий мир! 🐾\n\n"
-                f"_Напиши мне что-нибудь или используй /help_",
+                f"_Напиши мне что-нибудь_",
                 build_main_keyboard(uid)
             )
             return
         
-        # Очистка истории
         if data.startswith("clear_"):
             target = int(data.split("_")[1])
             if target == uid:
@@ -991,7 +878,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("⚠️ Не твоя кнопка", show_alert=True)
             return
         
-        # Настройки голоса
         if data.startswith("voice_"):
             target = int(data.split("_")[1])
             if target != uid:
@@ -1001,7 +887,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(query, voice_status_text(uid), build_voice_keyboard(uid))
             return
         
-        # Выбор голоса
         if data.startswith("setvoice_"):
             parts = data.split("_")
             target = int(parts[1])
@@ -1016,61 +901,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_manager.update_user(uid, voice_settings=settings)
             
             v = VOICES[vk]
-            await query.answer(f"{v['emoji']} Голос: {v['name']}", show_alert=True)
+            await query.answer(f"✅ Голос изменен на: {v['name']}", show_alert=True)
             await safe_edit(query, voice_status_text(uid), build_voice_keyboard(uid))
             return
         
-        # Изменение скорости
-        if data.startswith("speed_"):
-            parts = data.split("_")
-            target = int(parts[1])
-            delta = int(parts[2])
-            
-            if target != uid:
-                await query.answer("⚠️ Не твоя кнопка", show_alert=True)
-                return
-            
-            user = user_manager.get_user(uid)
-            settings = user.get("voice_settings", {})
-            
-            if delta == 0:
-                settings["speed"] = 0
-            else:
-                new_speed = settings.get("speed", 0) + delta
-                settings["speed"] = max(-50, min(50, new_speed))
-            
-            user_manager.update_user(uid, voice_settings=settings)
-            
-            await query.answer(f"⚡ Скорость: {settings['speed']:+d}%")
-            await safe_edit(query, voice_status_text(uid), build_voice_keyboard(uid))
-            return
-        
-        # Изменение тона
-        if data.startswith("pitch_"):
-            parts = data.split("_")
-            target = int(parts[1])
-            delta = int(parts[2])
-            
-            if target != uid:
-                await query.answer("⚠️ Не твоя кнопка", show_alert=True)
-                return
-            
-            user = user_manager.get_user(uid)
-            settings = user.get("voice_settings", {})
-            
-            if delta == 0:
-                settings["pitch"] = 0
-            else:
-                new_pitch = settings.get("pitch", 0) + delta
-                settings["pitch"] = max(-50, min(50, new_pitch))
-            
-            user_manager.update_user(uid, voice_settings=settings)
-            
-            await query.answer(f"🎵 Тон: {settings['pitch']:+d}Hz")
-            await safe_edit(query, voice_status_text(uid), build_voice_keyboard(uid))
-            return
-        
-        # Тест голоса
         if data.startswith("testvoice_"):
             target = int(data.split("_")[1])
             if target != uid:
@@ -1095,7 +929,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
         
-        # Показать полный текст
         if data.startswith("showtext_"):
             target = int(data.split("_")[1])
             full = context.bot_data.get(f"fulltext_{target}", "")
@@ -1110,7 +943,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("Текст не найден", show_alert=True)
             return
         
-        # Профиль
         if data.startswith("profile_"):
             target = int(data.split("_")[1])
             if target != uid:
@@ -1131,7 +963,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⚧️ Пол: {gender}\n"
                 f"💬 Сообщений: *{messages}*\n",
                 InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✏️ Изменить имя", callback_data=f"edit_name_{uid}")],
                     [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
                 ])
             )
@@ -1147,19 +978,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-# ============== ОБРАБОТЧИК ОШИБОК ==============
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Глобальный обработчик ошибок"""
     logger.error(f"Unhandled error: {context.error}")
     logger.error(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
 
-# ============== MAIN ==============
 def main():
-    """Запуск бота"""
-    print(f"🐺 Волчишка v5.0")
+    print(f"🐺 Волчишка v5.1 (Silero)")
     print(f"📊 API ключей: {len(GEMINI_API_KEYS)}")
     print(f"🎤 Голосов: {len(VOICES)}")
-    print(f"📝 Макс. история: {MAX_HISTORY_MESSAGES} сообщений")
     print(f"🚀 Запуск...")
     
     req = HTTPXRequest(
@@ -1171,10 +997,8 @@ def main():
     )
     
     app = Application.builder().token(TELEGRAM_TOKEN).request(req).build()
-    
     app.add_error_handler(error_handler)
     
-    # Conversation handler для онбординга
     onboard_handler = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
