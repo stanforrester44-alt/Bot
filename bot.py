@@ -38,7 +38,7 @@ if not HF_TOKEN:
     raise ValueError("HF_TOKEN (Hugging Face) не установлен в .env файле!")
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
-GEMINI_URL = f"https://noisy-rice-c2d3.larssobaka25.workers.dev/v1beta/models/{GEMINI_MODEL}:generateContent"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 POLLINATIONS_URL = "https://image.pollinations.ai/prompt/{prompt}"
 
 # Инициализация клиента Hugging Face для TTS
